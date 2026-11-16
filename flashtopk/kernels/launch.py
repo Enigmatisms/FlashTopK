@@ -23,7 +23,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
-from .common import BLOCK_KV, HEAD_DIM, NEXT_N, NUM_HEADS, PRUNE_BLOCK_Q, PRUNE_COLS, REFINE_BLOCK_Q
+from .common import (BLOCK_KV, HEAD_DIM, NEXT_N, NUM_HEADS, PRUNE_BLOCK_Q, PRUNE_COLS, REFINE_BLOCK_Q, rows_for,
+                     supported_heads)
 from .prune_sm100 import PruneSm100
 from .prune_sm90 import PruneSm90
 from .refine_sm100 import RefineSm100
@@ -51,11 +52,12 @@ def _stream():
     return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
 
-def scan_kv_splits(num_q: int, seq_len_kv: int, sm_count: int) -> int:
-    """One split once the 8-row tiles alone fill the GPU, else the fewest splits whose CTAs fill their last wave best
-    (within 5%), up to eight waves, never fewer than four 128-key blocks per split."""
+def scan_kv_splits(num_q: int, seq_len_kv: int, sm_count: int, rows: int = NEXT_N) -> int:
+    """One split once the query tiles (`rows` rows each: 8 at 32 heads, 4 at 64) alone fill the GPU, else the fewest
+    splits whose CTAs fill their last wave best (within 5%), up to eight waves, never fewer than four 128-key blocks
+    per split."""
     total_kv_blocks = math.ceil(seq_len_kv / BLOCK_KV)
-    num_q_blocks = math.ceil(num_q / NEXT_N)
+    num_q_blocks = math.ceil(num_q / rows)
     if num_q_blocks >= sm_count:
         return 1
     max_useful = max(1, (total_kv_blocks + 3) // 4)
@@ -130,14 +132,14 @@ def _elem(bf16: bool):
 
 
 @functools.cache
-def _compile_scan_sm100(single_split: bool, bf16: bool, dense: bool):
+def _compile_scan_sm100(single_split: bool, bf16: bool, dense: bool, num_heads: int):
     num_q, num_q_heads, seq_len_kv, num_scales, cand_cap = (cute.sym_int() for _ in range(5))
     elem = _elem(bf16)
     return cute.compile(
-        ScanSm100(single_split=single_split, bf16=bf16, dense=dense),
+        ScanSm100(single_split=single_split, bf16=bf16, dense=dense, num_heads=num_heads),
         make_fake_tensor(elem, (seq_len_kv, HEAD_DIM), divisibility=16),
         make_fake_tensor(elem, (num_q_heads, HEAD_DIM, 1), divisibility=16, leading_dim=1),
-        make_fake_tensor(Float32, (num_q, NUM_HEADS), divisibility=4),
+        make_fake_tensor(Float32, (num_q, num_heads), divisibility=4),
         make_fake_tensor(Float32, (num_scales,), divisibility=4),
         make_fake_tensor(Int32, (num_q,)),
         make_fake_tensor(Int32, (num_q,)),
@@ -158,21 +160,22 @@ def _compile_scan_sm100(single_split: bool, bf16: bool, dense: bool):
 def _scan_sm100(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt,
                 dense: bool, q_operand=None):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
-    num_splits = scan_kv_splits(num_q, seq_len_kv, sm_count(q.device.index))
+    num_heads = q.shape[1]
+    num_splits = scan_kv_splits(num_q, seq_len_kv, sm_count(q.device.index), rows_for(num_heads))
     bf16 = kv_scales is None
     scales = unit_scales(kv) if bf16 else padded_scales(kv_scales)
-    _compile_scan_sm100(num_splits == 1 and not dense, bf16, dense)(
-        as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights, scales, ks, ke, origin, inv_delta,
+    _compile_scan_sm100(num_splits == 1 and not dense, bf16, dense, num_heads)(
+        as_operand(kv), as_operand(q).view(num_q * num_heads, HEAD_DIM, 1), weights, scales, ks, ke, origin, inv_delta,
         th_bucket, cand_val, cand_idx, cand_cnt, num_q, seq_len_kv, num_splits,
     )
 
 
 @functools.cache
-def _compile_prune_sm100(bf16: bool):
+def _compile_prune_sm100(bf16: bool, group_rows: int):
     num_q, pair_heads, seq_len_kv, num_scales, num_words = (cute.sym_int() for _ in range(5))
     elem = _elem(bf16)
     return cute.compile(
-        PruneSm100(bf16=bf16),
+        PruneSm100(bf16=bf16, group_rows=group_rows),
         make_fake_tensor(elem, (seq_len_kv, HEAD_DIM), divisibility=16),
         make_fake_tensor(elem, (pair_heads, HEAD_DIM, 1), divisibility=16, leading_dim=1),
         make_fake_tensor(Float32, (num_q, PRUNE_COLS), divisibility=4),
@@ -195,14 +198,14 @@ def _compile_prune_sm100(bf16: bool):
 
 
 @functools.cache
-def _compile_refine_sm100(bf16: bool):
+def _compile_refine_sm100(bf16: bool, num_heads: int):
     num_q, num_q_heads, seq_len_kv, num_scales, num_words, cand_cap = (cute.sym_int() for _ in range(6))
     elem = _elem(bf16)
     return cute.compile(
-        RefineSm100(bf16=bf16),
+        RefineSm100(bf16=bf16, num_heads=num_heads),
         make_fake_tensor(elem, (seq_len_kv, HEAD_DIM), divisibility=16),
         make_fake_tensor(elem, (num_q_heads, HEAD_DIM, 1), divisibility=16, leading_dim=1),
-        make_fake_tensor(Float32, (num_q, NUM_HEADS), divisibility=4),
+        make_fake_tensor(Float32, (num_q, num_heads), divisibility=4),
         make_fake_tensor(Float32, (num_scales,), divisibility=4),
         make_fake_tensor(Int32, (num_words,), divisibility=4),
         make_fake_tensor(Int32, (num_q,)),
@@ -229,7 +232,8 @@ def _pruning_scales(kv, kv_scales, knsc):
 
 def _mask_sm100(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket, mask):
     num_q, seq_len_kv = ks.shape[0], kv.shape[0]
-    _compile_prune_sm100(kv_scales is None)(
+    group_rows = PRUNE_BLOCK_Q * math.ceil(num_q / PRUNE_BLOCK_Q) // mask.shape[0]  # mask_shape's planes per tile
+    _compile_prune_sm100(kv_scales is None, group_rows)(
         as_operand(kv), as_operand(q_prune).view(-1, HEAD_DIM, 1), w_prune, _pruning_scales(kv, kv_scales, knsc),
         knsc.reshape(-1), ks, ke, origin, inv_delta, th_bucket, allowance, mask.view(-1), num_q, seq_len_kv,
         mask.shape[1], prune_kv_splits(num_q, seq_len_kv, PRUNE_BLOCK_Q, 1, sm_count(kv.device.index)),
@@ -239,14 +243,15 @@ def _mask_sm100(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin
 def _refine_sm100(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
                   cand_cnt):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
+    num_heads = q.shape[1]
     bf16 = kv_scales is None
     mask_blocks = mask.shape[1]
     min_splits = math.ceil(mask_blocks / refine_max_blocks(bf16))
-    _compile_refine_sm100(bf16)(
-        as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights,
+    _compile_refine_sm100(bf16, num_heads)(
+        as_operand(kv), as_operand(q).view(num_q * num_heads, HEAD_DIM, 1), weights,
         _pruning_scales(kv, kv_scales, knsc), mask.view(-1), ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
         cand_cnt, num_q, seq_len_kv, mask_blocks,
-        prune_kv_splits(num_q, seq_len_kv, REFINE_BLOCK_Q, min_splits, sm_count(q.device.index)),
+        prune_kv_splits(num_q, seq_len_kv, rows_for(num_heads), min_splits, sm_count(q.device.index)),
     )
 
 
@@ -443,22 +448,24 @@ def prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks,
     """Key pruning in place of the scan, the same candidates: the score upper bound's mask, then the refine, which
     appends the kept keys whose full score passes the row's raw gate (counts must start at zero). q_prune is the
     planner's operand, already in the pruning kernel's layout."""
-    mask = prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket)
+    mask = prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket,
+                      group_rows=rows_for(q.shape[1]))
     prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
                  cand_cnt)
 
 
-def mask_shape(num_q: int, seq_len_kv: int) -> Tuple[int, int, int]:
-    """The pruning mask: per 8-row half of a 16-row tile and 128-key block, four words of one bit per key."""
-    return 2 * math.ceil(num_q / PRUNE_BLOCK_Q), math.ceil(seq_len_kv / BLOCK_KV), 4
+def mask_shape(num_q: int, seq_len_kv: int, group_rows: int = REFINE_BLOCK_Q) -> Tuple[int, int, int]:
+    """The pruning mask: per refine row group (group_rows rows of a 16-row tile: 8 at 32 heads, 4 at 64) and 128-key
+    block, four words of one bit per key."""
+    return PRUNE_BLOCK_Q // group_rows * math.ceil(num_q / PRUNE_BLOCK_Q), math.ceil(seq_len_kv / BLOCK_KV), 4
 
 
 def prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket,
-               mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+               mask: Optional[torch.Tensor] = None, group_rows: int = REFINE_BLOCK_Q) -> torch.Tensor:
     """Pruning's first kernel: the mask (mask_shape) of the keys whose score upper bound passes some row's gate in
-    each 8-row half."""
+    each refine row group of group_rows rows (the refine's tile: rows_for(num_heads); SM90 takes 8 only)."""
     if mask is None:
-        mask = torch.empty(mask_shape(ks.shape[0], kv.shape[0]), dtype=torch.int32, device=kv.device)
+        mask = torch.empty(mask_shape(ks.shape[0], kv.shape[0], group_rows), dtype=torch.int32, device=kv.device)
     run = _mask_sm90 if arch(kv) == 9 else _mask_sm100
     run(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket, mask)
     return mask
@@ -512,11 +519,11 @@ def sample_scores(q, kv, kv_scales, weights, ks, ke, num_samples: int, out: torc
 
 
 @functools.cache
-def _compile_decide():
+def _compile_decide(group: int = REFINE_BLOCK_Q):
     num_q, est_rows = cute.sym_int(), cute.sym_int()
     vec = (num_q,)
     return cute.compile(
-        Decide(),
+        Decide(group),
         make_fake_tensor(Int32, (est_rows, EST_WORDS)),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
@@ -536,13 +543,14 @@ def _estimate_scratch(device_index: int) -> torch.Tensor:
     return torch.empty(1, dtype=torch.float32, device=torch.device("cuda", device_index))
 
 
-def decide(est, ks, ke, scan_ks, prune_ks, flag, threshold: float, estimate=None) -> None:
+def decide(est, ks, ke, scan_ks, prune_ks, flag, threshold: float, estimate=None, group: int = REFINE_BLOCK_Q) -> None:
     """Adaptive pruning's choice on the device from the estimate rows' sample masks (plan.estimate_shares): flag[0]
     = (group estimate <= threshold), and the windows for the scan (scan_ks: ke when pruning, else ks) and for the
-    pruning kernels (prune_ks: the other way round); estimate[0], when given, receives the group estimate."""
+    pruning kernels (prune_ks: the other way round); estimate[0], when given, receives the group estimate. group:
+    the refine's rows (rows_for(num_heads)), which est's rows come in."""
     if estimate is None:
         estimate = _estimate_scratch(ks.device.index)
-    _compile_decide()(est, ks, ke, scan_ks, prune_ks, flag, estimate, ks.shape[0], threshold)
+    _compile_decide(group)(est, ks, ke, scan_ks, prune_ks, flag, estimate, ks.shape[0], threshold)
 
 
 @functools.cache
@@ -636,23 +644,23 @@ def select_staged(stage_scores, stage_indices, row_map, scores, indices) -> None
 
 
 @functools.cache
-def _compile_triage(words_per_head: int, sm90: bool):
+def _compile_triage(words_per_head: int, sm90: bool, num_heads: int):
     num_q, slots_flat = cute.sym_int(), cute.sym_int()
     vec = (num_q,)
     slots = (RECOVERY_ROWS,)
     return cute.compile(
-        Triage(words_per_head, sm90),
+        Triage(words_per_head, sm90, num_heads),
         make_fake_tensor(cutlass.Int64, (HEALTH_WORDS,)),
         make_fake_tensor(Int32, slots),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
-        make_fake_tensor(Int32, (num_q, NUM_HEADS * words_per_head)),
-        make_fake_tensor(Float32, (num_q, NUM_HEADS)),
+        make_fake_tensor(Int32, (num_q, num_heads * words_per_head)),
+        make_fake_tensor(Float32, (num_q, num_heads)),
         make_fake_tensor(Int32, slots),
         make_fake_tensor(Int32, slots),
         make_fake_tensor(Int32, slots),
         make_fake_tensor(Int32, (slots_flat,)),
-        make_fake_tensor(Float32, (RECOVERY_ROWS, NUM_HEADS)),
+        make_fake_tensor(Float32, (RECOVERY_ROWS, num_heads)),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
@@ -667,13 +675,14 @@ def triage(health, bad_rows, ks, ke, q, weights, row_map, slot_ks, slot_ke, q_ga
     """Recovery's plan from the health (triage.py): per-row slots (map, windows, gathered q and weights; q_gather
     holds the SM90 Q operand on SM90) and whole-call windows, each empty unless its recovery applies."""
     num_q = q.shape[0]
+    num_heads = q.shape[1]
     words = q.contiguous().view(num_q, -1).view(torch.int32)
-    _compile_triage(words.shape[1] // NUM_HEADS, arch(q) == 9)(
+    _compile_triage(words.shape[1] // num_heads, arch(q) == 9, num_heads)(
         health, bad_rows, ks, ke, words, weights, row_map, slot_ks, slot_ke, q_gather, w_gather, whole_map, whole_ks,
         whole_ke, num_q)
 
 
-def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int) -> None:
+def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int, num_heads: int = NUM_HEADS) -> None:
     """Compile every kernel variant a selection on this architecture and dtype can take (each once per process)."""
     if arch_major == 9:
         for single_split in (True, False):
@@ -683,22 +692,24 @@ def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int) -> None:
         _compile_prune_sm90(bf16)
     else:
         for single_split in (True, False):
-            _compile_scan_sm100(single_split, bf16, False)
-        _compile_scan_sm100(False, bf16, True)
-        _compile_prune_sm100(bf16)
-        _compile_refine_sm100(bf16)
+            _compile_scan_sm100(single_split, bf16, False, num_heads)
+        _compile_scan_sm100(False, bf16, True, num_heads)
+        _compile_prune_sm100(bf16, rows_for(num_heads))
+        _compile_refine_sm100(bf16, num_heads)
     _compile_sample_windows()
-    _compile_decide()
+    _compile_decide(rows_for(num_heads))
     _compile_seed_prep()
     for source in (CANDIDATES, DENSE, STAGED):
         _compile_select(topk, source)
-    _compile_triage(words_per_head, arch_major == 9)
+    _compile_triage(words_per_head, arch_major == 9, num_heads)
 
 
 def supported(q: torch.Tensor, kv: Optional[torch.Tensor] = None) -> bool:
-    """The kernels' shapes: [num_q, 32, 128] queries, 128-wide keys, FP8 or BF16, on SM90 or SM100."""
-    if not q.is_cuda or q.dim() != 3 or q.shape[1] != NUM_HEADS or q.shape[2] != HEAD_DIM:
+    """The kernels' shapes: [num_q, 32 or 64, 128] queries, 128-wide keys, FP8 or BF16; 64 heads on SM100 only."""
+    if not q.is_cuda or q.dim() != 3 or not supported_heads(q.shape[1]) or q.shape[2] != HEAD_DIM:
         return False
     if q.dtype not in (torch.float8_e4m3fn, torch.bfloat16) or arch(q) not in (9, 10):
+        return False
+    if q.shape[1] != NUM_HEADS and arch(q) != 10:
         return False
     return kv is None or (kv.dim() == 2 and kv.shape[1] == HEAD_DIM and kv.dtype == q.dtype)

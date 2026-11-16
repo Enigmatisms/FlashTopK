@@ -30,6 +30,7 @@ import torch
 
 from . import plan as planner
 from .kernels import launch
+from .kernels.common import NUM_HEADS, supported_heads
 from .kernels.selection import H_CAND_MAX, HEALTH_WORDS, RECOVERY_ROWS
 from .recovery import Recovery
 
@@ -77,14 +78,14 @@ def _arena_elements(rows: int, seq_len_kv: int, topk: int) -> int:
 
 
 def workspace_bytes(max_rows: int, max_kv: int, topk: int = 2048, chunk_size: Optional[int] = None,
-                    return_scores: bool = False) -> int:
+                    return_scores: bool = False, num_heads: int = NUM_HEADS) -> int:
     """Device memory a Selector planned for (max_rows, max_kv) holds, about: dominated by the candidate buffers
     (2 * 4 bytes * rows * candidate_cap), for at most chunk_size rows, plus a slice's scores without return_scores."""
     max_rows = min(max_rows, chunk_size or DEFAULT_CHUNK_SIZE)
     rows = [r for r in (max_rows, min(max_rows, 1023), min(max_rows, 127)) if r > 0]
     arena = max(_arena_elements(r, max_kv, topk) for r in rows) * 4
     scores = 0 if return_scores else max_rows * topk * 4
-    return arena + scores + max_rows * (4 * 4 + 3 * 4) + RECOVERY_ROWS * 32 * 128 * 2
+    return arena + scores + max_rows * (4 * 4 + 3 * 4) + RECOVERY_ROWS * num_heads * 128 * 2
 
 
 def windows_from_cu_seqlens(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor) -> Tuple[torch.Tensor,
@@ -103,8 +104,8 @@ def windows_from_cu_seqlens(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tens
 
 
 def supported(q: torch.Tensor, kv: Optional[torch.Tensor] = None) -> bool:
-    """Whether the kernels take these operands: [num_q, 32, 128] queries and [seq_len_kv, 128] keys, both FP8 E4M3
-    or both BF16, on an SM90 or SM100 GPU."""
+    """Whether the kernels take these operands: [num_q, 32 or 64, 128] queries (64 heads on SM100 only) and
+    [seq_len_kv, 128] keys, both FP8 E4M3 or both BF16, on an SM90 or SM100 GPU."""
     return launch.supported(q, kv)
 
 
@@ -152,11 +153,11 @@ class Selector:
     scores go to a buffer of one slice's rows in the workspace rather than to an output of every row.
     """
 
-    def __init__(self, topk: int = 2048, num_heads: int = 32, dtype: torch.dtype = torch.float8_e4m3fn,
+    def __init__(self, topk: int = 2048, num_heads: int = NUM_HEADS, dtype: torch.dtype = torch.float8_e4m3fn,
                  device: Optional[torch.device] = None, pruning: Optional[str] = None,
                  chunk_size: Optional[int] = None, return_scores: bool = False):
-        if num_heads != 32:
-            raise ValueError(f"num_heads must be 32, got {num_heads}")
+        if not supported_heads(num_heads):
+            raise ValueError(f"num_heads must be 32 or 64, got {num_heads}")
         if not 1 <= topk <= MAX_TOPK:
             raise ValueError(f"topk must be in [1, {MAX_TOPK}], got {topk}")
         if dtype not in (torch.float8_e4m3fn, torch.bfloat16):
@@ -170,6 +171,7 @@ class Selector:
         self.chunk_size = chunk_size
         self.return_scores = return_scores
         self.topk = topk
+        self.num_heads = num_heads
         self.dtype = dtype
         self.device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
         self.pruning = pruning
@@ -186,7 +188,7 @@ class Selector:
         if warmup:
             words_per_head = 128 * torch.empty((), dtype=self.dtype).element_size() // 4
             launch.warmup(torch.cuda.get_device_capability(self.device)[0], self.dtype == torch.bfloat16, self.topk,
-                          words_per_head)
+                          words_per_head, self.num_heads)
         max_rows = min(max_rows, self.chunk_size)
         max_rows, max_kv = max(max_rows, self.max_rows), max(max_kv, self.max_kv)
         if max_rows == self.max_rows and max_kv == self.max_kv and self._arena is not None:
@@ -211,7 +213,7 @@ class Selector:
         self._call_pruned = torch.zeros(1, **i32)
         self._bad_rows = torch.zeros(RECOVERY_ROWS, **i32)
         self._scores = None if self.return_scores else torch.empty(max_rows, self.topk, dtype=torch.float32, device=dev)
-        self._recovery = Recovery(max_rows, max_kv, self.topk, self.dtype, self._arena)
+        self._recovery = Recovery(max_rows, max_kv, self.topk, self.dtype, self._arena, self.num_heads)
         self.max_rows, self.max_kv = max_rows, max_kv
         return self
 
@@ -222,10 +224,13 @@ class Selector:
             raise ValueError(f"q is on {q.device}, the selector on {self.device}")
         if not launch.supported(q, kv):
             raise ValueError(f"unsupported operands: q {tuple(q.shape)} {q.dtype}, kv {tuple(kv.shape)} {kv.dtype} on "
-                             f"SM{launch.arch(q)}0 (need [num_q, 32, 128] and [seq_len_kv, 128], SM90 or SM100)")
+                             f"SM{launch.arch(q)}0 (need [num_q, 32 or 64, 128] and [seq_len_kv, 128], SM90 or SM100)")
         num_q = q.shape[0]
-        if weights.shape != (num_q, 32) or weights.dtype != torch.float32:
-            raise ValueError(f"weights must be float32 [{num_q}, 32], got {weights.dtype} {tuple(weights.shape)}")
+        if q.shape[1] != self.num_heads:
+            raise ValueError(f"q has {q.shape[1]} heads, the selector was built for {self.num_heads}")
+        if weights.shape != (num_q, self.num_heads) or weights.dtype != torch.float32:
+            raise ValueError(f"weights must be float32 [{num_q}, {self.num_heads}], got {weights.dtype} "
+                             f"{tuple(weights.shape)}")
         if ks.shape != (num_q,) or ke.shape != (num_q,):
             raise ValueError(f"ks and ke must be [{num_q}], got {tuple(ks.shape)} and {tuple(ke.shape)}")
         fp8 = self.dtype == torch.float8_e4m3fn
@@ -239,8 +244,8 @@ class Selector:
             kv_scales: Optional[torch.Tensor] = None,
             out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None
             ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-        """(scores [num_q, topk] float32, indices [num_q, topk] int32) of q [num_q, 32, 128] against kv
-        [seq_len_kv, 128] (FP8 with kv_scales [seq_len_kv] float32, or BF16), weights [num_q, 32] float32 and row
+        """(scores [num_q, topk] float32, indices [num_q, topk] int32) of q [num_q, num_heads, 128] against kv
+        [seq_len_kv, 128] (FP8 with kv_scales [seq_len_kv] float32, or BF16), weights [num_q, num_heads] float32 and row
         windows [ks, ke) (int32, or converted) with return_scores; else the indices alone (`out` then the indices)."""
         self._check(q, kv, weights, ks, ke, kv_scales)
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
@@ -348,9 +353,9 @@ def select(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.T
            return_scores: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Selector(...).run(...) with a selector kept per (device, dtype, topk, pruning, chunk_size, return_scores), its
     workspace grown to the largest call seen."""
-    key = (q.device, q.dtype, topk, pruning, chunk_size, return_scores)
+    key = (q.device, q.dtype, q.shape[1], topk, pruning, chunk_size, return_scores)
     selector = _SELECTORS.get(key)
     if selector is None:
-        selector = _SELECTORS[key] = Selector(topk, dtype=q.dtype, device=q.device, pruning=pruning,
-                                              chunk_size=chunk_size, return_scores=return_scores)
+        selector = _SELECTORS[key] = Selector(topk, num_heads=q.shape[1], dtype=q.dtype, device=q.device,
+                                              pruning=pruning, chunk_size=chunk_size, return_scores=return_scores)
     return selector.run(q, kv, weights, ks, ke, kv_scales, out)
