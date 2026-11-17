@@ -304,7 +304,7 @@ def _key_norm_kernel(KV, SCALES, OUT, n, n_out, FLAG, BLOCK: tl.constexpr, GATED
 def key_norms(plan, kv: torch.Tensor, flag: Optional[torch.Tensor] = None) -> None:
     """plan.knsc = scale * ||k|| of every key (only when flag is set, given one); a grid of a few programs an SM, so
     a gated launch the call does not need costs little."""
-    n_out = plan.knsc.numel()
+    n_out = int(plan.knsc.numel())
     grid = min(triton.cdiv(n_out, 64), 8 * launch.sm_count(kv.device.index))
     _key_norm_kernel[(grid,)](kv, plan.scales_or(kv), plan.knsc, kv.shape[0], n_out,
                               plan.knsc if flag is None else flag, BLOCK=64, GATED=flag is not None,

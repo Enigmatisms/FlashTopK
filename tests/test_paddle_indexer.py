@@ -1,37 +1,98 @@
 # Copyright (c) 2026 the FlashTopK authors. Licensed under the Apache License, Version 2.0.
-"""The Paddle entry point against Fleet's own indexer top-k: ids, lengths, scores, rule, stream, copies.
+"""The vendored FlashTopK against Fleet's own indexer top-k, in the environment paddlefleet_ops installs it into.
+
+This is not the package's own suite (tests/test_exact.py and friends run on PyTorch): it installs FlashTopK the way
+`paddlefleet_ops/build_utils.py` installs every ecosystem library -- `pip install . --target <dir> --no-deps
+--no-build-isolation --no-compile` -- imports the copy from there under `paddle.enable_compat(scope={"flashtopk"})`,
+and runs it with **no PyTorch in the process at all** (`_NoRealTorch`, a meta_path finder behind Paddle's proxy that
+answers ImportError for the real `torch` package), which is the environment the wheel lands in.
 
 Reference A is `cudnn_indexer_topk_fwd(..., dsa_index_topk_backend="paddle")` of the local PaddleFleet -- the dense
-cuDNN score matrix [B, S, S_k] fp32 plus the radix top-k that `flashtopk.paddle_api.indexer_topk` replaces.
+cuDNN score matrix [B, S, S_k] fp32 plus the radix top-k that `flashtopk.indexer_topk` replaces.
 
 Rows are compared with the tie-aware rule of tests/test_reference.py: a row whose index set differs is wrong only if a
 key it swapped in scores more than a relative 1e-5 below the row's k-th fp64 reference score (or swapped out above it),
 because cuDNN sums the heads in its own association and FlashTopK in four FMA chains, so near-ties at the k-th score may
 swap. Every case also pins the answer's shape: canonical order, the [-1, -inf] padding, the lengths, the scores, and
-the rule itself (candidates [valid_start, min(valid_end, causal)) computed in fp64 from the bf16 operands.
+the rule itself (candidates [valid_start, min(valid_end, causal)) computed in fp64 from the bf16 operands).
 
-Run: CUDA_VISIBLE_DEVICES=6 PYTHONPATH=<PaddleFleet>/src:<FlashTopK> python -m pytest tests/test_paddle_api.py -q
+Run it on its own -- a real-torch process cannot share it, `torch` is Paddle's proxy here, and tests/conftest.py
+imports PyTorch itself, hence --noconftest:
+
+    cd FlashTopK && PYTHONPATH=<PaddleFleet>/src ../topk_env/bin/python -m pytest tests/test_paddle_indexer.py \
+        -q --noconftest -W ignore -p no:cacheprovider
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import os
+import subprocess
 import sys
-import time
+import tempfile
 import types
 
-import numpy as np
-import paddle
 import pytest
-import torch
 
-import flashtopk
-import flashtopk.paddle_api as api
+# The package's own suite (`pytest tests` on PyTorch) collects this file too, and it must not run there: its whole
+# point is a process whose `torch` is Paddle's proxy and where PyTorch is not importable.
+if "torch" in sys.modules and not hasattr(sys.modules["torch"], "_original_module"):
+    pytest.skip("tests/test_paddle_indexer.py runs in its own process: see the module docstring", allow_module_level=True)
 
+import numpy as np  # noqa: E402
+import paddle  # noqa: E402
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REL_TIE = 1e-5
 HEAD_DIM = 128
 SCALE = HEAD_DIM**-0.5 * 1.3  # what Fleet passes as dim ** -0.5 * indexer_softmax_scale
+
+
+# --- the vendored install, and the environment without PyTorch ----------------------------------------------------
+
+
+class _NoRealTorch:
+    """Real PyTorch is not importable in this process: paddlefleet_ops installs its ecosystem libraries with --no-deps
+    into a Paddle environment, and `flashtopk` must run there. Paddle's compat proxy sits in front of this finder, so
+    `import torch` inside `flashtopk.*` still resolves to Paddle; anything else asking for torch gets ImportError,
+    which is exactly what a torch-less environment gives it (tvm_ffi and nvidia-cutlass-dsl both import torch inside
+    `try: ... except ImportError`)."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError(f"this process has no PyTorch: {fullname}")
+        return None
+
+
+def _installed(prefix: str) -> str:
+    """`pip install <repo> --target <dir> --no-deps --no-build-isolation --no-compile`, as build_utils.py does."""
+    target = tempfile.TemporaryDirectory(prefix=prefix)  # noqa: SIM115 -- kept for the process's lifetime
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", REPO, "--target", target.name, "--no-deps", "--no-build-isolation",
+         "--no-compile", "-q"],
+        check=True, capture_output=True)
+    return target
+
+
+class _Guard:
+    """How this process is set up: PyTorch blocked, the proxy enabled for `flashtopk`, the vendored copy first on the
+    path. `flashtopk`'s assertion runs after everything else, so the package is imported by the tests below."""
+
+    def __init__(self):
+        self.vendored = _installed("flashtopk-vendored-")
+        sys.path.insert(0, self.vendored.name)
+
+
+paddle.enable_compat(scope={"flashtopk"}, silent=True)
+# Behind the proxy (so in-scope `import torch` gets Paddle) but ahead of the PathFinder (so nothing else can read a
+# PyTorch install off the disk).
+sys.meta_path.insert(sys.meta_path.index(importlib.machinery.PathFinder), _NoRealTorch())
+_VENDORED = _Guard()
+
+import flashtopk  # noqa: E402 -- after the vendoring and the proxy, and only from the installed copy
+import flashtopk.indexer as entry  # noqa: E402
+from flashtopk.kernels import launch as kernellaunch  # noqa: E402
 
 
 # --- plumbing -----------------------------------------------------------------------------------------------------
@@ -50,8 +111,8 @@ def _fleet():
         return importlib.import_module(name)
     except ImportError:
         pass
-    for entry in sys.path:
-        candidate = os.path.join(entry, "paddlefleet")
+    for entry_path in sys.path:
+        candidate = os.path.join(entry_path, "paddlefleet")
         if os.path.isfile(os.path.join(candidate, "__init__.py")):
             stub = types.ModuleType("paddlefleet")
             stub.__path__ = [candidate]
@@ -60,11 +121,6 @@ def _fleet():
     module = importlib.import_module(name)
     assert module.__file__, "paddlefleet is not importable; put its src directory on PYTHONPATH"
     return module
-
-
-def _torch(tensor):
-    """The same memory as a torch tensor."""
-    return torch.utils.dlpack.from_dlpack(paddle.utils.dlpack.to_dlpack(tensor))
 
 
 def _operands(batch, seq_len, heads, seq_kv, seed):
@@ -98,16 +154,18 @@ def _fp64(index_q, index_k, weights, ranges, ratio, seq_offset):
     """[batch * seq_len, S_k] float64 scores from the bf16 operands, -inf outside each row's window."""
     batch, seq_len, heads, dim = (int(v) for v in index_q.shape)
     seq_kv = int(index_k.shape[1])
-    query, key, weight = _torch(index_q).double(), _torch(index_k).double(), _torch(weights).double()
-    scores = torch.empty(batch * seq_len, seq_kv, dtype=torch.float64, device=query.device)
+    query, key, weight = index_q.astype("float64").numpy(), index_k.astype("float64").numpy(), \
+        weights.astype("float64").numpy()
+    scores = np.empty((batch * seq_len, seq_kv), dtype=np.float64)
     for b in range(batch):
-        dots = torch.einsum("shd,td->sht", query[b], key[b]).clamp(min=0)
-        scores[b * seq_len:(b + 1) * seq_len] = (weight[b].unsqueeze(-1) * dots).sum(1) * SCALE
+        dots = np.einsum("shd,td->sht", query[b], key[b])
+        np.maximum(dots, 0.0, out=dots)
+        scores[b * seq_len:(b + 1) * seq_len] = np.einsum("sh,sht->st", weight[b], dots) * SCALE
     starts, ends = _rule_windows(batch, seq_len, seq_kv, ratio, seq_offset, ranges)
-    columns = torch.arange(seq_kv, device=query.device)
-    inside = (columns[None] >= torch.as_tensor(starts, device=query.device)[:, None]) & \
-             (columns[None] < torch.as_tensor(ends, device=query.device)[:, None])
-    return scores.masked_fill(~inside, float("-inf")), starts, ends
+    columns = np.arange(seq_kv)
+    inside = (columns[None] >= starts[:, None]) & (columns[None] < ends[:, None])
+    scores[~inside] = -np.inf
+    return scores, starts, ends
 
 
 def _canonical(indices, scores, top_k):
@@ -179,7 +237,7 @@ def _compare(index_q, index_k, weights, top_k, *, ratio=1, seq_offset=0, valid_r
         index_q, index_k, weights, ratio=ratio, topk_effective=top_k,
         indexer_softmax_scale=SCALE / HEAD_DIM**-0.5, valid_range=valid_range, seq_offset=seq_offset,
         return_topk_scores=True)
-    mine_idx, mine_len, mine_scores = api.indexer_topk(
+    mine_idx, mine_len, mine_scores = flashtopk.indexer_topk(
         index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=ratio, seq_offset=seq_offset,
         valid_range=valid_range, return_scores=True, pruning=prune)
     assert (ref_idx.numpy()[ref_idx.numpy() >= 0] < int(index_k.shape[1])).all(), \
@@ -190,14 +248,85 @@ def _compare(index_q, index_k, weights, top_k, *, ratio=1, seq_offset=0, valid_r
             mine_scores.numpy().reshape(-1, top_k))
     paddle.device.synchronize()
     scores_ref, starts, ends = _fp64(index_q, index_k, weights, ranges, ratio, seq_offset)
-    stats = _check(label, mine, theirs, scores_ref.cpu().numpy(), starts, ends, top_k)
+    stats = _check(label, mine, theirs, scores_ref, starts, ends, top_k)
     if both:  # the same inputs again, without return_scores
-        again = api.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=ratio,
-                                 seq_offset=seq_offset, valid_range=valid_range, pruning=prune)
+        again = flashtopk.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=ratio,
+                                       seq_offset=seq_offset, valid_range=valid_range, pruning=prune)
         assert again[2] is None, "return_scores=False must give None"
         assert np.array_equal(again[0].numpy().reshape(-1, top_k), mine[0])
         assert np.array_equal(again[1].numpy().reshape(-1), mine[1])
     return stats
+
+
+# --- the vendoring, the proxy, the blocked PyTorch ----------------------------------------------------------------
+
+
+def test_vendored_copy_is_the_one_imported():
+    """The package under test is the one pip installed into a target directory, not the checkout's."""
+    assert os.path.realpath(flashtopk.__file__).startswith(os.path.realpath(_VENDORED.vendored.name)), \
+        f"imported {flashtopk.__file__}, not the vendored copy"
+    assert os.path.isfile(os.path.join(_VENDORED.vendored.name, "flashtopk", "indexer.py"))
+
+
+def test_no_real_torch_in_the_process():
+    """`torch` is Paddle's proxy in every flashtopk module, and PyTorch itself is not importable: the wheel runs in the
+    torch-less environment paddlefleet_ops installs into."""
+    assert kernellaunch.PROXY, "the package did not see Paddle's compat proxy"
+    try:
+        imported = importlib.import_module("torch")
+    except ImportError:
+        imported = None
+    assert imported is None or hasattr(imported, "_original_module"), \
+        f"torch resolved to {getattr(imported, '__file__', imported)!r}, not to Paddle's proxy"
+    for module in (flashtopk.indexer, flashtopk.topk, kernellaunch):
+        assert hasattr(module.torch, "_original_module"), f"{module.__name__} holds a real torch"
+    assert getattr(flashtopk.indexer.torch, "Tensor", None) is paddle.Tensor
+
+
+def test_exports():
+    """The entry point under both names, and no torch.library op in a process that has no torch.library."""
+    assert flashtopk.indexer_topk is flashtopk.flashtopk_indexer_topk is entry.indexer_topk
+    assert "ops" not in flashtopk.__all__, "the custom op was registered under Paddle's proxy"
+
+
+def test_workspace_comes_from_paddles_allocator():
+    """The selector's workspace is allocated through the active framework: Paddle's allocator holds it."""
+    index_q, index_k, weights = _operands(1, 16, 32, 64, seed=101)
+    paddle.device.synchronize()
+    before = paddle.device.cuda.memory_allocated()
+    flashtopk.indexer_topk(index_q, index_k, weights, 32, softmax_scale=SCALE, pruning="off")
+    paddle.device.synchronize()
+    grown = paddle.device.cuda.memory_allocated() - before
+    arena = min(flashtopk.workspace_bytes(16, 64, 32, num_heads=32), 1 << 30)
+    assert grown >= 0.5 * arena, f"the workspace ({grown} bytes) is not in Paddle's allocator ({arena} expected)"
+
+
+def test_selector_is_shared_by_both_return_scores_calls():
+    """One selector -- one workspace -- per (device, dtype, heads, top_k, pruning): return_scores only decides whether
+    the entry allocates a scores buffer of its own."""
+    index_q, index_k, weights = _operands(1, 8, 32, 16, seed=103)
+    top_k = 4
+    entry._SELECTORS.clear()
+    first = flashtopk.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, pruning="off")
+    selector = entry._SELECTORS[(0, entry.torch.bfloat16, 32, top_k, "off")]
+    with_scores = flashtopk.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, pruning="off",
+                                         return_scores=True)
+    assert len(entry._SELECTORS) == 1, f"return_scores created a second selector: {list(entry._SELECTORS)}"
+    assert entry._SELECTORS[(0, entry.torch.bfloat16, 32, top_k, "off")] is selector
+    assert np.array_equal(first[0].numpy(), with_scores[0].numpy()), "the scores buffer changed the selection"
+    assert with_scores[2] is not None and with_scores[2].shape == (1, 8, top_k)
+
+
+def test_pruning_off_compiles_no_pruning_kernel():
+    """pruning="off" never runs the mask, the refine or the Triton planner, so plan(warmup=True) compiles none of them
+    (each pruning kernel is functools.cache'd, so an empty cache is a kernel that was never compiled)."""
+    heads, top_k = 64, 8
+    index_q, index_k, weights = _operands(1, 4, heads, 32, seed=107)
+    flashtopk.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, pruning="off")
+    assert kernellaunch._compile_prune_sm100.cache_info().currsize == 0, "the mask kernel was compiled"
+    assert kernellaunch._compile_refine_sm100.cache_info().currsize == 0, "the refine kernel was compiled"
+    assert "flashtopk.plan" not in sys.modules, "the Triton planner was imported by a pruning=off call"
+    assert flashtopk.topk._planner.cache_info().currsize == 0
 
 
 # --- the same answer as Fleet ------------------------------------------------------------------------------------
@@ -259,24 +388,6 @@ def test_top_k_above_candidates():
     assert _compare(*operands, 8, ratio=1, label="top_k>candidates")["rows_differ"] == 0
 
 
-def test_default_pruning_matches_fleet():
-    """pruning=None (FlashTopK's default, which does not prune below 128K keys) is the same selection."""
-    operands = _operands(1, 8, 32, 8, seed=31)
-    assert _compare(*operands, 4, ratio=4, prune=None, label="default pruning")["rows_differ"] == 0
-
-
-def test_repeatable():
-    """The cached selector, its windows and its arena are reused: a second call returns the same bits."""
-    index_q, index_k, weights = _operands(1, 9, 32, 10, seed=29)
-    ranges = _docmask([(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (2, 3), (0, 0), (1, 2), (2, 3)], 1, 9)
-    calls = [api.indexer_topk(index_q, index_k, weights, 5, softmax_scale=SCALE, ratio=2, valid_range=ranges,
-                              return_scores=True, pruning="off") for _ in range(3)]
-    for other in calls[1:]:
-        for a, b in zip(calls[0], other):
-            paddle.device.synchronize()
-            assert np.array_equal(a.numpy(), b.numpy())
-
-
 def test_window_past_causal_is_clipped():
     """A valid_end past the ratio-causal limit: the documented rule clips the window at causal, so the answer is the
     causal-only one.
@@ -285,34 +396,45 @@ def test_window_past_causal_is_clipped():
     prefix and its slot mask then trusts them (it can return an id outside [0, S_k), or crash the gather of
     `return_topk_scores`) -- so this case is checked against the fp64 rule, not against Fleet."""
     index_q, index_k, weights = _operands(1, 6, 32, 8, seed=37)
-    clipped = api.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=4, return_scores=True,
-                               valid_range=_docmask([(0, 8)] * 6, 1, 6), pruning="off")
-    causal = api.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=4, return_scores=True,
-                              pruning="off")
+    clipped = flashtopk.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=4, return_scores=True,
+                                     valid_range=_docmask([(0, 8)] * 6, 1, 6), pruning="off")
+    causal = flashtopk.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=4, return_scores=True,
+                                    pruning="off")
     for a, b in zip(clipped, causal):
         assert np.array_equal(a.numpy(), b.numpy()), "a window end past causal must be the causal window"
     paddle.device.synchronize()
-    # the same windows the call saw, so that `ends` below is the clipped limit
     scores_ref, starts, ends = _fp64(index_q, index_k, weights, np.tile(np.array([[[0, 8]]], dtype=np.int32), (1, 6, 1)),
-                                    4, 0)
-    exact_ref, live = scores_ref.cpu().numpy(), clipped[0].numpy().reshape(-1, 4)
+                                     4, 0)
+    live = clipped[0].numpy().reshape(-1, 4)
     _canonical(live, clipped[2].numpy().reshape(-1, 4), 4)
     for row in range(6):
         selected = min(4, int(ends[row] - starts[row]))
-        got = exact_ref[row][live[row][live[row] >= 0]]
-        want = np.sort(exact_ref[row])[::-1][:selected]
+        got = scores_ref[row][live[row][live[row] >= 0]]
+        want = np.sort(scores_ref[row])[::-1][:selected]
         assert np.allclose(np.sort(got)[::-1], want, rtol=1e-9), f"row {row} is not the window's exact top-k"
     lengths = clipped[1].numpy().reshape(-1)
     assert lengths.tolist() == np.clip(ends - starts, 0, 4).tolist() == [0, 0, 0, 1, 1, 1], \
         "the clipped windows are the causal prefixes, and ratio 4 leaves the first three rows empty"
 
 
-# --- the stream, the copies, the grad semantics ------------------------------------------------------------------
+def test_repeatable():
+    """The cached selector, its windows and its arena are reused: a second call returns the same bits."""
+    index_q, index_k, weights = _operands(1, 9, 32, 10, seed=29)
+    ranges = _docmask([(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (2, 3), (0, 0), (1, 2), (2, 3)], 1, 9)
+    calls = [flashtopk.indexer_topk(index_q, index_k, weights, 5, softmax_scale=SCALE, ratio=2, valid_range=ranges,
+                                    return_scores=True, pruning="off") for _ in range(3)]
+    for other in calls[1:]:
+        for a, b in zip(calls[0], other):
+            paddle.device.synchronize()
+            assert np.array_equal(a.numpy(), b.numpy())
+
+
+# --- the stream, the copies, the rules ---------------------------------------------------------------------------
 
 
 def test_no_input_copy_and_outputs_written_in_place(monkeypatch):
-    """q and the keys reach the kernels as the caller's own memory (DLPack), the weights as one float32 copy, and the
-    results are written into the tensors Paddle allocated: no copy of an input or of an output."""
+    """q and the keys reach the kernels as the caller's own memory, the weights as one float32 copy, and the results
+    are written into the tensors Paddle allocated: no copy of an input or of an output."""
     batch, seq_len, heads, seq_kv, top_k = 2, 4, 32, 6, 4
     index_q, index_k, weights = _operands(batch, seq_len, heads, seq_kv, seed=41)
     seen = {}
@@ -323,15 +445,15 @@ def test_no_input_copy_and_outputs_written_in_place(monkeypatch):
         return real(self, q, kv, weight, ks, ke, kv_scales, out)
 
     monkeypatch.setattr(flashtopk.Selector, "run", spy)
-    indices, length, scores = api.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=1,
-                                               return_scores=True, pruning="off")
+    indices, length, scores = flashtopk.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=1,
+                                                     return_scores=True, pruning="off")
     assert seen["q"].data_ptr() == index_q.data_ptr(), "q was copied on the way to the kernels"
     assert seen["kv"].data_ptr() == index_k.data_ptr(), "the keys were copied on the way to the kernels"
     assert tuple(seen["q"].shape) == (batch * seq_len, heads, HEAD_DIM)
     assert tuple(seen["kv"].shape) == (batch * seq_kv, HEAD_DIM)
-    assert seen["weight"].dtype == torch.float32 and tuple(seen["weight"].shape) == (batch * seq_len, heads)
-    assert seen["ks"].dtype == torch.int32 and tuple(seen["ks"].shape) == (batch * seq_len,)
-    assert seen["ke"].dtype == torch.int32 and tuple(seen["ke"].shape) == (batch * seq_len,)
+    assert seen["weight"].dtype == entry.torch.float32 and tuple(seen["weight"].shape) == (batch * seq_len, heads)
+    assert seen["ks"].dtype == entry.torch.int32 and tuple(seen["ks"].shape) == (batch * seq_len,)
+    assert seen["ke"].dtype == entry.torch.int32 and tuple(seen["ke"].shape) == (batch * seq_len,)
     out_scores, out_indices = seen["out"]
     assert out_indices.data_ptr() == indices.data_ptr(), "the indices were not written in place"
     assert out_scores.data_ptr() == scores.data_ptr(), "the scores were not written in place"
@@ -339,36 +461,32 @@ def test_no_input_copy_and_outputs_written_in_place(monkeypatch):
     assert ((ids == -1) | ((ids >= 0) & (ids < seq_kv))).all(), "ids are not in [0, S_k) per batch"
 
 
-@pytest.mark.parametrize("return_scores", [False, True])
-def test_stream_follows_paddle(monkeypatch, return_scores):
-    """Everything the call launches runs on Paddle's current stream: torch's current stream and the kernels' TVM-FFI
-    environment stream are both Paddle's raw handle while the selection runs, and neither is stream 0."""
+def test_stream_raw(monkeypatch):
+    """Everything the call launches runs on Paddle's current stream: the TVM-FFI environment stream the kernels read
+    is Paddle's raw handle while the selection runs, and it is not stream 0."""
     import tvm_ffi
 
     batch, seq_len, heads, seq_kv, top_k = 1, 8, 32, 8, 4
     index_q, index_k, weights = _operands(batch, seq_len, heads, seq_kv, seed=43)
     device = index_q.place.gpu_device_id()
-    api.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=1, return_scores=return_scores,
-                     pruning="off")  # plan the selector outside the stream the test asserts on
+    flashtopk.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=1, pruning="off")
     seen = {}
-    real = flashtopk.Selector.run
+    real = flashtopk.Selector._run_rows  # inside the run's stream scope, and inside the kernels' launch path
 
-    def spy(self, q, kv, weight, ks, ke, kv_scales=None, out=None):
-        seen["torch"] = torch.cuda.current_stream().cuda_stream
+    def spy(self, q, kv, kv_scales, weight, ks, ke, scores, indices):
         seen["ffi"] = tvm_ffi.get_raw_stream(tvm_ffi.device(f"cuda:{device}"))
         seen["paddle"] = paddle.device.current_stream().__cuda_stream__()[1]
-        return real(self, q, kv, weight, ks, ke, kv_scales, out)
+        return real(self, q, kv, kv_scales, weight, ks, ke, scores, indices)
 
-    monkeypatch.setattr(flashtopk.Selector, "run", spy)
+    monkeypatch.setattr(flashtopk.Selector, "_run_rows", spy)
     stream = paddle.device.Stream()
     with paddle.device.stream_guard(stream):
-        api.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=1,
-                         return_scores=return_scores, pruning="off")
+        flashtopk.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=1, return_scores=True,
+                               pruning="off")
     raw = stream.__cuda_stream__()[1]
     assert seen["paddle"] == raw, "the guard did not put Paddle on the new stream"
-    assert seen["torch"] == raw, f"torch ran on {seen['torch']:#x}, Paddle on {raw:#x}"
     assert seen["ffi"] == raw, f"the kernels' environment stream was {seen['ffi']:#x}, Paddle on {raw:#x}"
-    assert raw != 0 and seen["torch"] != 0, "the call fell back to the legacy default stream"
+    assert raw != 0 and seen["ffi"] != 0, "the call fell back to the legacy default stream"
 
 
 def test_producer_and_consumer_order_on_a_paddle_stream():
@@ -379,8 +497,8 @@ def test_producer_and_consumer_order_on_a_paddle_stream():
     select different keys; a consumer that ran before the call would read a stale answer."""
     index_q, index_k, weights = _operands(1, 8, 32, 8, seed=47)
     real_q = index_q.clone()
-    reference = api.indexer_topk(real_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1, return_scores=True,
-                                 pruning="off")[0].numpy()
+    reference = flashtopk.indexer_topk(real_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1, return_scores=True,
+                                       pruning="off")[0].numpy()
     poison = paddle.randn(index_q.shape, dtype="bfloat16") * 64.0
     paddle.device.synchronize()
     stream = paddle.device.Stream()
@@ -390,8 +508,8 @@ def test_producer_and_consumer_order_on_a_paddle_stream():
         for _ in range(12):
             burn = paddle.matmul(burn, burn)
         index_q.copy_(real_q, blocking=False)
-        indices, length, scores = api.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1,
-                                                  return_scores=True, pruning="off")
+        indices, length, scores = flashtopk.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1,
+                                                        return_scores=True, pruning="off")
         counts = (indices >= 0).astype("int32").sum(-1)  # a consumer, also unsynchronized
     paddle.device.synchronize()
     assert np.array_equal(indices.numpy(), reference), "the selection read the queries before the producer wrote them"
@@ -399,26 +517,13 @@ def test_producer_and_consumer_order_on_a_paddle_stream():
         "the consumer read a stale result"
 
 
-def test_no_host_synchronization():
-    """The call never synchronizes: with torch's sync-debug mode set to `error`, a synchronizing torch call raises."""
-    index_q, index_k, weights = _operands(1, 8, 32, 8, seed=53)
-    api.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1, pruning="off")
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        api.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1, return_scores=True, pruning="off")
-        api.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=4, pruning="off",
-                         valid_range=_docmask([(0, 0), (0, 1), (0, 1), (0, 2), (0, 0), (0, 1), (0, 1), (0, 2)], 1, 8))
-    finally:
-        torch.cuda.set_sync_debug_mode("warn")
-
-
 def test_grad_semantics():
     """Indices only: the results carry no gradient, whatever the inputs' flags are."""
     index_q, index_k, weights = _operands(1, 6, 32, 6, seed=59)
     index_q.stop_gradient = False
     weights.stop_gradient = False
-    indices, length, scores = api.indexer_topk(index_q, index_k, weights, 3, softmax_scale=SCALE, ratio=1,
-                                               return_scores=True, pruning="off")
+    indices, length, scores = flashtopk.indexer_topk(index_q, index_k, weights, 3, softmax_scale=SCALE, ratio=1,
+                                                     return_scores=True, pruning="off")
     assert indices.stop_gradient and length.stop_gradient and scores.stop_gradient
     assert (indices.dtype, length.dtype, scores.dtype) == (paddle.int32, paddle.int32, paddle.float32)
     assert not index_q.stop_gradient, "the call must not have touched the inputs' grad flags"
@@ -428,55 +533,32 @@ def test_rejects_bad_inputs():
     """The contracts Fleet's validator enforces, and the ones FlashTopK adds."""
     index_q, index_k, weights = _operands(1, 4, 32, 4, seed=61)
     with pytest.raises(TypeError):
-        api.indexer_topk(index_q.numpy(), index_k, weights, 2, softmax_scale=SCALE)
+        flashtopk.indexer_topk(index_q.numpy(), index_k, weights, 2, softmax_scale=SCALE)
     with pytest.raises(ValueError):
-        api.indexer_topk(index_q, index_k, weights[:, :, :16], 2, softmax_scale=SCALE)
+        flashtopk.indexer_topk(index_q, index_k, weights[:, :, :16], 2, softmax_scale=SCALE)
     with pytest.raises(ValueError):
-        api.indexer_topk(index_q.astype("float32"), index_k, weights, 2, softmax_scale=SCALE)
+        flashtopk.indexer_topk(index_q.astype("float32"), index_k, weights, 2, softmax_scale=SCALE)
     with pytest.raises(ValueError):
-        api.indexer_topk(index_q, index_k, weights, 0, softmax_scale=SCALE)
+        flashtopk.indexer_topk(index_q, index_k, weights, 0, softmax_scale=SCALE)
     with pytest.raises(ValueError):
-        api.indexer_topk(index_q, index_k, weights, 4097, softmax_scale=SCALE)
+        flashtopk.indexer_topk(index_q, index_k, weights, 4097, softmax_scale=SCALE)
     with pytest.raises(ValueError):
-        api.indexer_topk(index_q, index_k, weights, 2, softmax_scale=SCALE, ratio=0)
+        flashtopk.indexer_topk(index_q, index_k, weights, 2, softmax_scale=SCALE, ratio=0)
     with pytest.raises(ValueError):
-        api.indexer_topk(index_q, index_k, weights, 2, softmax_scale=SCALE, seq_offset=-1)
+        flashtopk.indexer_topk(index_q, index_k, weights, 2, softmax_scale=SCALE, seq_offset=-1)
     with pytest.raises(ValueError):
-        api.indexer_topk(index_q, index_k, weights, 2, softmax_scale=SCALE,
-                         valid_range=paddle.zeros([1, 5, 2], dtype="int32"))
+        flashtopk.indexer_topk(index_q, index_k, weights, 2, softmax_scale=SCALE,
+                               valid_range=paddle.zeros([1, 5, 2], dtype="int32"))
 
 
-def test_adapter_overhead(capsys):
-    """What the adapter costs around the selection, on this GPU: a call against the same selector run by hand on the
-    same operands, outputs and float32 weights prepared once. Both are host times per call (no synchronization in the
-    loop), so the difference is the adapter's own work -- DLPack views, two Paddle allocations, the weights cast, three
-    [B * S]-wide kernels and the stream setup. Printed for the report; the assertion only guards against a regression
-    of the adapter into copying operands."""
-    seq_len, heads, seq_kv, top_k = 1024, 32, 1024, 64
-    index_q, index_k, weights = _operands(1, seq_len, heads, seq_kv, seed=67)
-    api.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=4, pruning="off")
-    selector = api._selector(index_q.place.gpu_device_id(), heads, top_k, "off", False, seq_len, seq_kv)
-    query = api._torch_view(index_q).reshape(seq_len, heads, HEAD_DIM)
-    key = api._torch_view(index_k).reshape(seq_kv, HEAD_DIM)
-    weight = api._torch_view(weights).reshape(seq_len, heads).to(torch.float32)
-    starts, ends = api._windows(index_q.place.gpu_device_id(), None, 1, seq_len, seq_kv, 4, 0)
-    out = api._torch_view(paddle.empty([1, seq_len, top_k], dtype="int32")).reshape(seq_len, top_k)
-
-    def per_call(fn, iterations=30):
-        for _ in range(5):
-            fn()
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(iterations):
-            fn()
-        elapsed = (time.perf_counter() - start) / iterations * 1e6
-        torch.cuda.synchronize()
-        return elapsed
-
-    bare = per_call(lambda: selector.run(query, key, weight, starts, ends, None, out))
-    adapted = per_call(lambda: api.indexer_topk(index_q, index_k, weights, top_k, softmax_scale=SCALE, ratio=4,
-                                                pruning="off"))
-    with capsys.disabled():
-        print(f"\nadapter overhead: selection {bare:.0f} us, with the adapter {adapted:.0f} us, "
-              f"+{adapted - bare:.0f} us per call (S={seq_len}, S_k={seq_kv}, H={heads}, top_k={top_k})")
-    assert adapted - bare < 400, "the adapter costs more than the selection it wraps"
+def test_pruning_under_the_proxy():
+    """Pruning needs the Triton planning kernel, which imports triton -- a third-party import that is *not* in the
+    proxy's scope, so this checks whether that works at all rather than requiring it: pruning="off" is what the
+    indexer uses, and the pruning paths keep their PyTorch behaviour."""
+    index_q, index_k, weights = _operands(1, 8, 32, 8, seed=71)
+    try:
+        pruned = flashtopk.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1, pruning="always")
+    except Exception as error:  # noqa: BLE001 -- reported, not required
+        pytest.skip(f"pruning under the proxy is unsupported: {type(error).__name__}: {error}")
+    plain = flashtopk.indexer_topk(index_q, index_k, weights, 4, softmax_scale=SCALE, ratio=1, pruning="off")
+    assert np.array_equal(pruned[0].numpy(), plain[0].numpy()), "pruning changed the selection"

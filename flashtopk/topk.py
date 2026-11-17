@@ -22,13 +22,13 @@ One call runs, all on one stream and without reading anything back:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import os
 from typing import Optional, Tuple, Union
 
 import torch
 
-from . import plan as planner
 from .kernels import launch
 from .kernels.common import NUM_HEADS, supported_heads
 from .kernels.selection import H_CAND_MAX, HEALTH_WORDS, RECOVERY_ROWS
@@ -96,7 +96,7 @@ def windows_from_cu_seqlens(cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tens
     cu_k = cu_seqlens_k.to(torch.int64)
     len_q = cu_q[1:] - cu_q[:-1]
     len_k = cu_k[1:] - cu_k[:-1]
-    seq = torch.repeat_interleave(torch.arange(len_q.numel(), device=cu_q.device), len_q)
+    seq = torch.repeat_interleave(torch.arange(int(len_q.numel()), device=cu_q.device), len_q)
     t = torch.arange(int(cu_q[-1]), device=cu_q.device) - cu_q[:-1][seq]
     ks = cu_k[:-1][seq]
     ke = ks + (len_k - len_q)[seq] + t + 1
@@ -137,6 +137,15 @@ class Info:
 
 def _env_default(name: str, default: str) -> str:
     return os.environ.get("FLASHTOPK_" + name, default)
+
+
+@functools.cache
+def _planner():
+    """The pruning planner, imported at its first use: its Triton kernel and the triton package are only needed by a
+    call that prunes, and pruning="off" never does."""
+    from . import plan  # noqa: PLC0415
+
+    return plan
 
 
 class Selector:
@@ -180,6 +189,8 @@ class Selector:
         self.last_info: Optional[Info] = None
         self._arena = None
         self._recovery = None
+        self._views: dict = {}
+        self._device_scope = None
 
     def plan(self, max_rows: int, max_kv: int, warmup: bool = True) -> "Selector":
         """Allocate the workspace for calls of up to max_rows rows (at most chunk_size of them at once) and max_kv
@@ -187,8 +198,9 @@ class Selector:
         never compiles one (the Triton planner compiles at its first use and caches on disk)."""
         if warmup:
             words_per_head = 128 * torch.empty((), dtype=self.dtype).element_size() // 4
-            launch.warmup(torch.cuda.get_device_capability(self.device)[0], self.dtype == torch.bfloat16, self.topk,
-                          words_per_head, self.num_heads)
+            capability = torch.cuda.get_device_capability(launch.device_index(self.device))[0]
+            launch.warmup(capability, self.dtype == torch.bfloat16, self.topk, words_per_head, self.num_heads,
+                          self.pruning)
         max_rows = min(max_rows, self.chunk_size)
         max_rows, max_kv = max(max_rows, self.max_rows), max(max_kv, self.max_kv)
         if max_rows == self.max_rows and max_kv == self.max_kv and self._arena is not None:
@@ -213,9 +225,32 @@ class Selector:
         self._call_pruned = torch.zeros(1, **i32)
         self._bad_rows = torch.zeros(RECOVERY_ROWS, **i32)
         self._scores = None if self.return_scores else torch.empty(max_rows, self.topk, dtype=torch.float32, device=dev)
-        self._recovery = Recovery(max_rows, max_kv, self.topk, self.dtype, self._arena, self.num_heads)
+        self._recovery = Recovery(max_rows, max_kv, self.topk, self.dtype, self._arena, self.num_heads,
+                                  arena_elements=elements)
+        self._device_scope = torch.cuda.device(launch.device_index(dev))  # one context object, entered per call
+        self._views.clear()  # the buffers above are new
         self.max_rows, self.max_kv = max_rows, max_kv
         return self
+
+    def _row_views(self, num_q: int, seq_len_kv: int) -> dict:
+        """The aliases of the plan's buffers that a call works through, built once per call shape: a call takes about a
+        dozen of them, and under Paddle's compat proxy each slice or view is a framework call of its own. The buffers
+        are allocated once, in plan(), so the views stay valid until the next plan."""
+        key = (num_q, seq_len_kv)
+        views = self._views.get(key)
+        if views is None:
+            cap = candidate_cap(self.topk, num_q, seq_len_kv)
+            width = math.ceil(sample_count(seq_len_kv) / 4) * 4
+            arena = self._arena
+            views = self._views[key] = dict(
+                sample=arena[: num_q * width].view(num_q, width),
+                cand_val=arena[: num_q * cap].view(num_q, cap),
+                cand_idx=arena[num_q * cap: 2 * num_q * cap].view(torch.int32).view(num_q, cap),
+                origin=self._origin[:num_q], inv_delta=self._inv_delta[:num_q], th_bucket=self._th_bucket[:num_q],
+                cand_cnt=self._cand_cnt[:num_q], lo=self._lo[:num_q], hi=self._hi[:num_q],
+                scan_ks=self._scan_ks[:num_q], prune_ks=self._prune_ks[:num_q],
+                scores=None if self._scores is None else self._scores[:num_q])
+        return views
 
     def _check(self, q, kv, weights, ks, ke, kv_scales):
         if q.dtype != self.dtype or kv.dtype != self.dtype:
@@ -234,7 +269,8 @@ class Selector:
         if ks.shape != (num_q,) or ke.shape != (num_q,):
             raise ValueError(f"ks and ke must be [{num_q}], got {tuple(ks.shape)} and {tuple(ke.shape)}")
         fp8 = self.dtype == torch.float8_e4m3fn
-        if fp8 and (kv_scales is None or kv_scales.numel() != kv.shape[0] or kv_scales.dtype != torch.float32):
+        if fp8 and (kv_scales is None or int(kv_scales.numel()) != kv.shape[0]
+                    or kv_scales.dtype != torch.float32):
             raise ValueError(f"FP8 keys need float32 kv_scales of {kv.shape[0]} elements")
         if not fp8 and kv_scales is not None:
             raise ValueError("BF16 keys take no kv_scales")
@@ -246,7 +282,11 @@ class Selector:
             ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """(scores [num_q, topk] float32, indices [num_q, topk] int32) of q [num_q, num_heads, 128] against kv
         [seq_len_kv, 128] (FP8 with kv_scales [seq_len_kv] float32, or BF16), weights [num_q, num_heads] float32 and row
-        windows [ks, ke) (int32, or converted) with return_scores; else the indices alone (`out` then the indices)."""
+        windows [ks, ke) (int32, or converted) with return_scores; else the indices alone (`out` then the indices).
+
+        `out` may also be a (scores, indices) pair, whatever `return_scores` says: the scores then go to that buffer
+        (which must be [num_q, topk] float32) and the return value still follows return_scores. One selector can
+        therefore serve calls that want the scores and calls that do not."""
         self._check(q, kv, weights, ks, ke, kv_scales)
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         rows = min(num_q, self.chunk_size)
@@ -256,72 +296,87 @@ class Selector:
         if out is None:
             scores = torch.empty(num_q, topk, dtype=torch.float32, device=q.device) if self.return_scores else None
             indices = torch.empty(num_q, topk, dtype=torch.int32, device=q.device)
+        elif isinstance(out, tuple):
+            scores, indices = out
         else:
-            scores, indices = out if self.return_scores else (None, out)
+            scores, indices = None, out
         result = (scores, indices) if self.return_scores else indices
         if num_q == 0:
             return result
-        q, kv, weights = q.contiguous(), kv.contiguous(), weights.contiguous()
-        ks = ks.to(torch.int32).contiguous()
-        ke = ke.to(torch.int32).contiguous()
+        # The conversions the kernels need, skipped when the operands already have the layout and dtype: under
+        # Paddle's compat proxy each of these is a framework call of its own (and `to` allocates).
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not kv.is_contiguous():
+            kv = kv.contiguous()
+        if not weights.is_contiguous():
+            weights = weights.contiguous()
+        if ks.dtype != torch.int32:
+            ks = ks.to(torch.int32)
+        if not ks.is_contiguous():
+            ks = ks.contiguous()
+        if ke.dtype != torch.int32:
+            ke = ke.to(torch.int32)
+        if not ke.is_contiguous():
+            ke = ke.contiguous()
         if kv_scales is not None:
             kv_scales = kv_scales.reshape(-1).contiguous()
-        if num_q <= self.chunk_size:
-            slice_scores = scores if self.return_scores else self._scores[:num_q]
-            self.last_info = Info(*self._run_rows(q, kv, kv_scales, weights, ks, ke, slice_scores, indices))
-            return result
+        with launch.env_stream(q):
+            if num_q <= self.chunk_size:
+                slice_scores = scores if scores is not None else self._row_views(num_q, seq_len_kv)["scores"]
+                self.last_info = Info(*self._run_rows(q, kv, kv_scales, weights, ks, ke, slice_scores, indices))
+                return result
 
-        # Slices of chunk_size rows. Each slice's health is folded into the call's on the device (word H_CAND_MAX is
-        # a maximum, the rest are counts), and the call pruned if any slice did.
-        total, pruned_any = self._call_health, self._call_pruned
-        total.zero_()
-        pruned_any.zero_()
-        estimate = None
-        for a in range(0, num_q, self.chunk_size):
-            b = min(num_q, a + self.chunk_size)
-            slice_scores = scores[a:b] if self.return_scores else self._scores[:b - a]
-            health, pruned, estimate = self._run_rows(q[a:b], kv, kv_scales, weights[a:b], ks[a:b], ke[a:b],
-                                                      slice_scores, indices[a:b])
-            cand_max = torch.maximum(total[H_CAND_MAX:H_CAND_MAX + 1], health[H_CAND_MAX:H_CAND_MAX + 1])
-            total.add_(health)
-            total[H_CAND_MAX:H_CAND_MAX + 1].copy_(cand_max)
-            if pruned is True:
-                pruned_any.fill_(1)
-            elif pruned is not False:
-                torch.maximum(pruned_any, pruned, out=pruned_any)
-        self.last_info = Info(total, pruned_any, estimate)
-        return result
+            # Slices of chunk_size rows. Each slice's health is folded into the call's on the device (word H_CAND_MAX
+            # is a maximum, the rest are counts), and the call pruned if any slice did.
+            total, pruned_any = self._call_health, self._call_pruned
+            total.zero_()
+            pruned_any.zero_()
+            estimate = None
+            for a in range(0, num_q, self.chunk_size):
+                b = min(num_q, a + self.chunk_size)
+                slice_scores = (scores[a:b] if scores is not None
+                                else self._row_views(b - a, seq_len_kv)["scores"])
+                health, pruned, estimate = self._run_rows(q[a:b], kv, kv_scales, weights[a:b], ks[a:b], ke[a:b],
+                                                          slice_scores, indices[a:b])
+                cand_max = torch.maximum(total[H_CAND_MAX:H_CAND_MAX + 1], health[H_CAND_MAX:H_CAND_MAX + 1])
+                total.add_(health)
+                total[H_CAND_MAX:H_CAND_MAX + 1].copy_(cand_max)
+                if pruned is True:
+                    pruned_any.fill_(1)
+                elif pruned is not False:
+                    torch.maximum(pruned_any, pruned, out=pruned_any)
+            self.last_info = Info(total, pruned_any, estimate)
+            return result
 
     def _run_rows(self, q, kv, kv_scales, weights, ks, ke, scores, indices):
         """One pass over at most chunk_size rows, writing their selection into scores and indices: (health, pruned,
         estimate) as Info takes them."""
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         topk = self.topk
-        cap = candidate_cap(topk, num_q, seq_len_kv)
+        views = self._row_views(num_q, seq_len_kv)
         num_samples = sample_count(seq_len_kv)
-        width = math.ceil(num_samples / 4) * 4
-        arena = self._arena
-        sample = arena[: num_q * width].view(num_q, width)
-        cand_val = arena[: num_q * cap].view(num_q, cap)
-        cand_idx = arena[num_q * cap: 2 * num_q * cap].view(torch.int32).view(num_q, cap)
-        origin, inv_delta = self._origin[:num_q], self._inv_delta[:num_q]
-        th_bucket, cand_cnt = self._th_bucket[:num_q], self._cand_cnt[:num_q]
+        sample, cand_val, cand_idx = views["sample"], views["cand_val"], views["cand_idx"]
+        origin, inv_delta = views["origin"], views["inv_delta"]
+        th_bucket, cand_cnt = views["th_bucket"], views["cand_cnt"]
         health, bad_rows = self._health, self._bad_rows
-        lo, hi = self._lo[:num_q], self._hi[:num_q]
-        seed_topk = min(topk + SEED_MARGIN, cap)
+        lo, hi = views["lo"], views["hi"]
+        seed_topk = min(topk + SEED_MARGIN, cand_val.shape[1])
         slack = GATE_SLACK * topk
         pruned = False
         estimate = None
 
         scope = launch.sm90_q_scope(q)
-        with torch.cuda.device(q.device), scope:
+        with self._device_scope, scope:
             launch.sample_scores(q, kv, kv_scales, weights, ks, ke, num_samples, sample, cand_cnt, lo, hi, health)
             launch.seed_prep(sample, ks, ke, lo, hi, seed_topk, slack, min(K_MIN, seed_topk), origin, inv_delta,
                              th_bucket, cand_cnt)
             gate = (origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt)
             mode = self.pruning
-            if mode == "adaptive" and not planner.adaptive_eligible(q, seq_len_kv):
-                mode = "off"
+            if mode != "off":
+                planner = _planner()
+                if mode == "adaptive" and not planner.adaptive_eligible(q, seq_len_kv):
+                    mode = "off"
             if mode == "off":
                 launch.scan(q, kv, kv_scales, weights, ks, ke, *gate)
             elif mode == "always":
@@ -331,7 +386,7 @@ class Selector:
                 pruned = True
             else:
                 # The scan sees empty windows when the call prunes, the pruning kernels when it does not.
-                scan_ks, prune_ks = self._scan_ks[:num_q], self._prune_ks[:num_q]
+                scan_ks, prune_ks = views["scan_ks"], views["prune_ks"]
                 plan = planner.adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket,
                                                  self._flag, scan_ks, prune_ks, self._estimate)
                 estimate = self._estimate

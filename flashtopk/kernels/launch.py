@@ -52,6 +52,56 @@ def _stream():
     return cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
 
+# `paddle.enable_compat(scope={"flashtopk"})` makes the `import torch` of the modules it loads resolve to Paddle: those
+# `torch` names are `paddle.compat.proxy.ProxyModule` objects (which keep the Paddle module they stand for in
+# `_original_module`), `torch.Tensor` is `paddle.Tensor`, and `torch.cuda` is `paddle.cuda`. Everything in the package
+# then works on Paddle tensors unchanged; the two places the proxy is not transparent are the CUDA stream (the kernels
+# take theirs from the TVM-FFI environment, which knows torch but not Paddle) and torch.library, which has no Paddle
+# equivalent -- `PROXY` gates both.
+PROXY = hasattr(torch, "_original_module")
+
+
+_LAST_DEVICE: list = []  # [device, index]: the last device looked up, since a Place's .index crosses into Paddle
+
+
+def device_index(tensor_or_device) -> int:
+    """The CUDA ordinal of a tensor's device or of a device itself, as an int (a torch.device and a paddle Place both
+    answer here), memoized on the last device: the kernels ask once per launch."""
+    device = getattr(tensor_or_device, "device", tensor_or_device)
+    if len(_LAST_DEVICE) == 2 and _LAST_DEVICE[0] == device:
+        return _LAST_DEVICE[1]
+    index = getattr(device, "index", None)
+    index = int(index if index is not None else device.get_device_id())
+    _LAST_DEVICE[:] = [device, index]
+    return index
+
+
+def raw_stream(tensor: torch.Tensor) -> int:
+    """The raw `cudaStream_t` of the framework's current stream on the tensor's device."""
+    stream = torch.cuda.current_stream(tensor.device)
+    raw = getattr(stream, "cuda_stream", None)  # torch.cuda.Stream
+    if raw is None:
+        raw = stream.stream_base.raw_stream  # paddle.device.Stream, through the proxy
+    return int(raw)
+
+
+@contextlib.contextmanager
+def env_stream(t: torch.Tensor):
+    """Point the TVM-FFI environment stream at the framework's current stream for the block.
+
+    The kernels take their stream from `TVMFFIEnvGetStream` (`_stream()`), which under PyTorch resolves to torch's
+    current stream by itself. Paddle's compatibility proxy is not a torch the FFI knows, so Paddle's stream is set
+    explicitly -- once per selection call, not once per kernel launch.
+    """
+    if not PROXY:
+        yield
+        return
+    import tvm_ffi  # noqa: PLC0415 -- only Paddle needs the FFI's Python side, and only for its stream environment
+
+    with tvm_ffi.use_raw_stream(tvm_ffi.device(f"cuda:{device_index(t)}"), raw_stream(t)):
+        yield
+
+
 def scan_kv_splits(num_q: int, seq_len_kv: int, sm_count: int, rows: int = NEXT_N) -> int:
     """One split once the query tiles (`rows` rows each: 8 at 32 heads, 4 at 64) alone fill the GPU, else the fewest
     splits whose CTAs fill their last wave best (within 5%), up to eight waves, never fewer than four 128-key blocks
@@ -93,8 +143,15 @@ def sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+@functools.cache
+def arch_of(device_index: int) -> int:
+    return torch.cuda.get_device_capability(device_index)[0]
+
+
 def arch(t: torch.Tensor) -> int:
-    return torch.cuda.get_device_capability(t.device)[0]
+    """The device's compute capability major, cached per device: `arch` is asked once per kernel launch, and under
+    Paddle's compat proxy every such query crosses into Paddle."""
+    return arch_of(device_index(t))
 
 
 @functools.cache
@@ -111,8 +168,10 @@ def unit_scales(kv: torch.Tensor) -> torch.Tensor:
 def padded_scales(kv_scales: torch.Tensor) -> torch.Tensor:
     """FP8 kv scales as the kernels' TMA reads them: a multiple of 4 floats (the tail is read, never used)."""
     scales = kv_scales.reshape(-1)
-    if scales.numel() % 4:
-        scales = torch.nn.functional.pad(scales, (0, 4 - scales.numel() % 4))
+    # int(): a 0-d tensor under Paddle's compat proxy, so `% 4` would be a device-side op and the `if` a read of it.
+    n = int(scales.numel())
+    if n % 4:
+        scales = torch.nn.functional.pad(scales, (0, 4 - n % 4))
     return scales
 
 
@@ -227,7 +286,7 @@ def _compile_refine_sm100(bf16: bool, num_heads: int):
 
 def _pruning_scales(kv, kv_scales, knsc):
     # The pruning kernel reads scales and key norms through one symbolic length: as long as knsc.
-    return unit_scales(kv)[: knsc.numel()] if kv_scales is None else padded_scales(kv_scales)
+    return unit_scales(kv)[: int(knsc.numel())] if kv_scales is None else padded_scales(kv_scales)
 
 
 def _mask_sm100(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket, mask):
@@ -432,15 +491,15 @@ def scan(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_v
 
 
 def scan_dense(q, kv, kv_scales, weights, ks, ke, out: torch.Tensor, scratch: torch.Tensor,
-               q_operand: Optional[torch.Tensor] = None) -> None:
+               q_operand: Optional[torch.Tensor] = None, out_i32: Optional[torch.Tensor] = None) -> None:
     """out[r, key] = row r's score of every key of its window [ks[r], ke[r]), in the scan's bits; other entries are
     left as they were. scratch: any [num_q] 4-byte tensor (the gate's inputs, read and unused). On SM90 q_operand,
     when given, is q's operand already laid out (q_operand_sm90)."""
     gate = scratch.view(torch.float32)
     bucket = scratch.view(torch.int32)
     run = _scan_sm90 if arch(q) == 9 else _scan_sm100
-    run(q, kv, kv_scales, weights, ks, ke, gate, gate, bucket, out, out.view(torch.int32), bucket, dense=True,
-        q_operand=q_operand)
+    run(q, kv, kv_scales, weights, ks, ke, gate, gate, bucket, out, out_i32 if out_i32 is not None
+        else out.view(torch.int32), bucket, dense=True, q_operand=q_operand)
 
 
 def prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket,
@@ -483,7 +542,7 @@ def prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delt
 def _sample_positions(seq_len_kv: int, num_samples: int, device_index: int) -> torch.Tensor:
     """The shared sample's keys p_j = floor((2j + 1) L / (2M)), int64."""
     j = torch.arange(num_samples, device=torch.device("cuda", device_index), dtype=torch.int64)
-    return torch.div((2 * j + 1) * seq_len_kv, 2 * num_samples, rounding_mode="floor")
+    return (2 * j + 1) * seq_len_kv // (2 * num_samples)
 
 
 @functools.cache
@@ -624,14 +683,16 @@ def select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_ro
                                                  health, bad_rows, cand_val.shape[0], 1, int(stats))
 
 
-def select_dense(dense, ks, ke, row_map, scores, indices, splits: int = 1) -> None:
+def select_dense(dense, ks, ke, row_map, scores, indices, splits: int = 1,
+                 dense_i32: Optional[torch.Tensor] = None) -> None:
     """Recovery: slot s's exact top-k over its window [ks[s], ke[s]) of dense[s] (the index is the column), in
     canonical order, to row row_map[s] of scores / indices; slots mapped to -1 are skipped. With splits > 1 each slot
     is cut into that many slices, and slice p of slot s writes its own top-k to row s * splits + p of the stage
     buffers scores / indices instead (select_staged finishes)."""
     health, bad_rows = _unused_health(dense.device.index)
-    _compile_select(scores.shape[1], DENSE)(dense, dense.view(torch.int32), ks, ks, ke, row_map, scores, indices,
-                                            health, bad_rows, dense.shape[0] * splits, splits, 0)
+    _compile_select(scores.shape[1], DENSE)(dense, dense_i32 if dense_i32 is not None else dense.view(torch.int32),
+                                            ks, ks, ke, row_map, scores, indices, health, bad_rows,
+                                            dense.shape[0] * splits, splits, 0)
 
 
 def select_staged(stage_scores, stage_indices, row_map, scores, indices) -> None:
@@ -682,20 +743,26 @@ def triage(health, bad_rows, ks, ke, q, weights, row_map, slot_ks, slot_ke, q_ga
         whole_ke, num_q)
 
 
-def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int, num_heads: int = NUM_HEADS) -> None:
-    """Compile every kernel variant a selection on this architecture and dtype can take (each once per process)."""
+def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int, num_heads: int = NUM_HEADS,
+           pruning: str = "adaptive") -> None:
+    """Compile every kernel variant a selection on this architecture, dtype and pruning mode can take (each once per
+    process). The pruning kernels (the mask and the refine) are left out for pruning="off", which never runs them."""
+    prunes = pruning != "off"
     if arch_major == 9:
         for single_split in (True, False):
             _compile_scan_sm90(bf16, single_split, False)
-            _compile_refine_sm90(bf16, single_split)
         _compile_scan_sm90(bf16, False, True)
-        _compile_prune_sm90(bf16)
+        if prunes:
+            for single_split in (True, False):
+                _compile_refine_sm90(bf16, single_split)
+            _compile_prune_sm90(bf16)
     else:
         for single_split in (True, False):
             _compile_scan_sm100(single_split, bf16, False, num_heads)
         _compile_scan_sm100(False, bf16, True, num_heads)
-        _compile_prune_sm100(bf16, rows_for(num_heads))
-        _compile_refine_sm100(bf16, num_heads)
+        if prunes:
+            _compile_prune_sm100(bf16, rows_for(num_heads))
+            _compile_refine_sm100(bf16, num_heads)
     _compile_sample_windows()
     _compile_decide(rows_for(num_heads))
     _compile_seed_prep()
